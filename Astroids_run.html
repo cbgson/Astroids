@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Asteroids — Mobile</title>
+<style>
+  html,body { height:100%; margin:0; background:#000; color:#ddd; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; -webkit-tap-highlight-color: rgba(0,0,0,0); }
+  #gameCanvas { display:block; width:100%; height:100vh; background: radial-gradient(ellipse at center,#001216 0%, #000 60%); touch-action: none; }
+  /* On-screen controls */
+  .controls {
+    position: fixed;
+    left:0; right:0; bottom: 8px;
+    display:flex; justify-content:space-between; pointer-events:none;
+    padding:8px;
+  }
+  .left, .right {
+    display:flex; gap:8px; align-items:center; pointer-events:auto;
+  }
+  .btn {
+    width:64px; height:64px; border-radius:12px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+    color:#fff; display:flex; align-items:center; justify-content:center;
+    font-weight:700; user-select:none; -webkit-user-select:none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    touch-action: none;
+  }
+  .btn:active { transform: translateY(2px); }
+  .small { width:48px; height:48px; border-radius:10px; font-size:14px; }
+  .center {
+    position: fixed; left:50%; transform:translateX(-50%); bottom: 82px;
+    pointer-events:auto;
+  }
+  .hud {
+    position: fixed; left:8px; top:8px; pointer-events:none; color:#bfe;
+    text-shadow:0 1px 6px rgba(0,0,0,0.8); font-weight:600;
+    background: rgba(0,0,0,0.25); padding:6px 8px; border-radius:8px;
+    border:1px solid rgba(255,255,255,0.04);
+  }
+  #startScreen {
+    position: fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    background: linear-gradient(rgba(0,0,0,0.4), rgba(0,0,0,0.4));
+    z-index: 50; flex-direction:column; gap:12px;
+    color:#fff; text-align:center; padding:20px;
+  }
+  .muted { opacity:0.6; font-size:13px; }
+  @media (orientation:portrait) {
+    .btn { width:56px; height:56px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<div class="hud" id="hud">
+  Score: <span id="score">0</span> &nbsp; Lives: <span id="lives">3</span>
+</div>
+
+<!-- On-screen controls -->
+<div class="controls">
+  <div class="left">
+    <div class="btn" id="btn-left">◀</div>
+    <div class="btn" id="btn-right">▶</div>
+  </div>
+
+  <div class="center">
+    <div class="btn small" id="btn-fire">FIRE</div>
+  </div>
+
+  <div class="right">
+    <div class="btn" id="btn-thrust">THRUST</div>
+    <div class="btn small" id="btn-pause">❚❚</div>
+  </div>
+</div>
+
+<!-- Start / permission screen -->
+<div id="startScreen">
+  <h1 style="margin:0">Asteroids</h1>
+  <div class="muted">Touch controls • Tilt optional (permission required)</div>
+  <div style="display:flex; gap:10px; margin-top:12px;">
+    <button id="startBtn" class="btn">START</button>
+    <button id="tiltBtn" class="btn small">ENABLE TILT</button>
+  </div>
+  <div style="margin-top:10px; font-size:13px; color:#cde;">Tip: rotate phone to landscape for more play area</div>
+</div>
+
+<script>
+/*
+  Mobile-friendly Asteroids clone.
+  Controls:
+    - On-screen buttons: left, right, thrust, fire, pause
+    - Keyboard: left/right/up/space
+    - Optional device tilt for steering (requires permission on some browsers)
+*/
+
+(() => {
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let W = 800, H = 600;
+
+  function resize() {
+    // Fit canvas to window while preserving enough resolution for crispness
+    const ratio = window.devicePixelRatio || 1;
+    W = Math.max(320, window.innerWidth);
+    H = Math.max(320, window.innerHeight);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    canvas.width = Math.floor(window.innerWidth * ratio);
+    canvas.height = Math.floor(window.innerHeight * ratio);
+    ctx.setTransform(ratio,0,0,ratio,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // Utilities
+  const TWO_PI = Math.PI * 2;
+  function rand(min, max) { return Math.random() * (max - min) + min; }
+  function wrapX(x) { if (x < 0) return x + W; if (x > W) return x - W; return x; }
+  function wrapY(y) { if (y < 0) return y + H; if (y > H) return y - H; return y; }
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+  // Game state
+  let ship, bullets, asteroids, particles;
+  let score = 0, lives = 3;
+  let paused = false;
+  let lastTime = 0;
+  const maxBullets = 6;
+  const bulletLifetime = 0.9; // seconds
+
+  // Audio (simple)
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function playBeep(type='shoot', time=0) {
+    const now = audioCtx.currentTime + (time||0);
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type === 'explosion' ? 'sawtooth' : 'square';
+    o.frequency.value = type === 'shoot' ? 800 : (type === 'hit' ? 120 : 200);
+    g.gain.value = 0.08;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + (type === 'explosion' ? 0.6 : 0.08));
+    o.stop(now + (type === 'explosion' ? 0.7 : 0.1));
+  }
+
+  function resetGame() {
+    ship = {
+      x: W/2, y: H/2, radius: 12,
+      angle: -Math.PI/2, speed: 0, vx:0, vy:0,
+      thrusting:false, dead:false, respawnTimer:0, blinkTime:0,
+      invulnerable: 0
+    };
+    bullets = [];
+    asteroids = [];
+    particles = [];
+    score = 0;
+    lives = 3;
+    spawnAsteroids(4);
+    updateHud();
+  }
+
+  function spawnAsteroids(n) {
+    for (let i = 0; i < n; i++) {
+      let x, y;
+      // spawn away from ship
+      do {
+        x = rand(0, W); y = rand(0, H);
+      } while (Math.hypot(x - ship.x, y - ship.y) < 120);
+      asteroids.push(makeAsteroid(x, y, 3));
+    }
+  }
+
+  function makeAsteroid(x, y, size) {
+    return {
+      x, y,
+      radius: 12 * size,
+      size, // 3 = large, 2 = medium, 1 = small
+      vx: rand(-40, 40), vy: rand(-40, 40),
+      angle: rand(0, TWO_PI), verts: Math.floor(rand(7, 12)),
+      offset: Array.from({length:10}, () => rand(0.6, 1.4))
+    };
+  }
+
+  function updateHud() {
+    document.getElementById('score').textContent = Math.floor(score);
+    document.getElementById('lives').textContent = lives;
+  }
+
+  // Input handling
+  const keys = { left:false, right:false, thrust:false, fire:false };
+  let canFire = true;
+
+  function keyDown(e) {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = true;
+    if (e.key === 'ArrowUp' || e.key === 'w') keys.thrust = true;
+    if (e.key === ' ' || e.key === 'k') keys.fire = true;
+    if (e.key === 'p') togglePause();
+  }
+  function keyUp(e) {
+    if (e.key === 'ArrowLeft' || e.key === 'a') keys.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd') keys.right = false;
+    if (e.key === 'ArrowUp' || e.key === 'w') keys.thrust = false;
+    if (e.key === ' ' || e.key === 'k') keys.fire = false;
+  }
+  window.addEventListener('keydown', keyDown);
+  window.addEventListener('keyup', keyUp);
+
+  // Touch / on-screen buttons
+  function bindButton(id, name) {
+    const el = document.getElementById(id);
+    el.addEventListener('touchstart', (e) => { e.preventDefault(); keys[name] = true; }, {passive:false});
+    el.addEventListener('touchend', (e) => { e.preventDefault(); keys[name] = false; }, {passive:false});
+    el.addEventListener('mousedown', (e) => { e.preventDefault(); keys[name] = true; });
+    el.addEventListener('mouseup', (e) => { e.preventDefault(); keys[name] = false; });
+    el.addEventListener('mouseleave', (e) => { keys[name] = false; });
+  }
+  bindButton('btn-left','left');
+  bindButton('btn-right','right');
+  bindButton('btn-thrust','thrust');
+
+  // Fire button with single-tap behavior
+  const fireBtn = document.getElementById('btn-fire');
+  fireBtn.addEventListener('touchstart', (e)=>{ e.preventDefault(); keys.fire = true; shoot(); keys.fire=false; }, {passive:false});
+  fireBtn.addEventListener('mousedown', (e)=>{ e.preventDefault(); keys.fire = true; shoot(); keys.fire=false; });
+  document.getElementById('btn-pause').addEventListener('click', togglePause);
+
+  function togglePause() {
+    paused = !paused;
+    document.getElementById('btn-pause').textContent = paused ? '▶' : '❚❚';
+    if (!paused) {
+      lastTime = performance.now();
+      loop(lastTime);
+    }
+  }
+
+  // Shooting
+  function shoot() {
+    if (bullets.length >= maxBullets) return;
+    if (ship.dead || ship.invulnerable > 0) return;
+    // create bullet
+    const speed = 280;
+    const bx = ship.x + Math.cos(ship.angle) * ship.radius;
+    const by = ship.y + Math.sin(ship.angle) * ship.radius;
+    bullets.push({
+      x: bx, y: by,
+      vx: ship.vx + Math.cos(ship.angle) * speed,
+      vy: ship.vy + Math.sin(ship.angle) * speed,
+      life: bulletLifetime
+    });
+    playBeep('shoot');
+  }
+
+  // Collisions and physics update
+  function update(dt) {
+    if (ship.dead) {
+      ship.respawnTimer -= dt;
+      if (ship.respawnTimer <= 0) {
+        if (lives > 0) {
+          ship.dead = false;
+          ship.x = W/2; ship.y = H/2; ship.vx = ship.vy = 0;
+          ship.invulnerable = 2.5; // seconds
+        } else {
+          // game over -> restart
+          showStartScreen(true);
+        }
+      }
+    } else {
+      // Steering
+      if (keys.left) ship.angle -= 4 * dt;
+      if (keys.right) ship.angle += 4 * dt;
+      if (keys.thrust) {
+        ship.vx += Math.cos(ship.angle) * 200 * dt;
+        ship.vy += Math.sin(ship.angle) * 200 * dt;
+        // add small particles
+        if (Math.random() < 0.6) {
+          particles.push({ x: ship.x - Math.cos(ship.angle) * ship.radius,
+                           y: ship.y - Math.sin(ship.angle)*ship.radius,
+                           vx: -ship.vx*0.2 + rand(-30,30), vy: -ship.vy*0.2 + rand(-30,30),
+                           life: 0.5 });
+        }
+      }
+      // position
+      ship.x += ship.vx * dt;
+      ship.y += ship.vy * dt;
+      ship.x = wrapX(ship.x);
+      ship.y = wrapY(ship.y);
+      if (ship.invulnerable > 0) ship.invulnerable -= dt;
+    }
+
+    // bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.x = wrapX(b.x);
+      b.y = wrapY(b.y);
+      b.life -= dt;
+      if (b.life <= 0) bullets.splice(i,1);
+    }
+
+    // asteroids
+    for (let a of asteroids) {
+      a.x += a.vx * dt;
+      a.y += a.vy * dt;
+      a.x = wrapX(a.x);
+      a.y = wrapY(a.y);
+      a.angle += 0.4 * dt;
+    }
+
+    // particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i,1);
+    }
+
+    // bullet-asteroid collisions
+    for (let i = asteroids.length - 1; i >= 0; i--) {
+      const a = asteroids[i];
+      for (let j = bullets.length - 1; j >= 0; j--) {
+        const b = bullets[j];
+        if (Math.hypot(a.x - b.x, a.y - b.y) < a.radius) {
+          // hit
+          bullets.splice(j,1);
+          splitAsteroid(i);
+          score += 100 * a.size;
+          updateHud();
+          playBeep('hit');
+          break;
+        }
+      }
+    }
+
+    // ship-asteroid collisions
+    if (!ship.dead && ship.invulnerable <= 0) {
+      for (let i = asteroids.length - 1; i >= 0; i--) {
+        const a = asteroids[i];
+        if (Math.hypot(a.x - ship.x, a.y - ship.y) < a.radius + ship.radius*0.8) {
+          // explode ship
+          explode(ship.x, ship.y, 20);
+          playBeep('explosion');
+          ship.dead = true;
+          ship.respawnTimer = 1.5;
+          lives--;
+          updateHud();
+          // remove a
+          splitAsteroid(i);
+          break;
+        }
+      }
+    }
+
+    // spawn new waves if none left
+    if (asteroids.length === 0) {
+      spawnAsteroids(Math.min(6, 4 + Math.floor(score / 1000)));
+    }
+
+    // limit ship speed slightly
+    const speed = Math.hypot(ship.vx, ship.vy);
+    if (speed > 300) {
+      ship.vx *= 300 / speed;
+      ship.vy *= 300 / speed;
+    }
+  }
+
+  function splitAsteroid(index) {
+    const a = asteroids[index];
+    // explosion particles
+    explode(a.x, a.y, 8 + a.size*6);
+    // split into two smaller if size > 1
+    if (a.size > 1) {
+      const s = a.size - 1;
+      asteroids.splice(index, 1,
+        makeAsteroid(a.x + rand(-4,4), a.y + rand(-4,4), s),
+        makeAsteroid(a.x + rand(-4,4), a.y + rand(-4,4), s)
+      );
+    } else {
+      asteroids.splice(index, 1);
+    }
+  }
+
+  function explode(x, y, count) {
+    for (let i=0;i<count;i++) {
+      particles.push({
+        x, y,
+        vx: rand(-180,180), vy: rand(-180,180),
+        life: rand(0.4, 1.2)
+      });
+    }
+  }
+
+  // Render
+  function draw() {
+    // background
+    ctx.fillStyle = '#000012';
+    ctx.fillRect(0,0,W,H);
+
+    // stars (subtle)
+    ctx.fillStyle = '#071a1a';
+    for (let i = 0; i < 40; i++) {
+      // drawn once per frame is fine for small count
+      const sx = (i * 997) % W;
+      const sy = ((i * 541) % H);
+      ctx.fillRect(sx, sy, 1, 1);
+    }
+
+    // particles
+    for (let p of particles) {
+      const alpha = Math.max(0, p.life / 1.2);
+      ctx.fillStyle = `rgba(255,196,96,${alpha})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 2.2, 0, TWO_PI); ctx.fill();
+    }
+
+    // asteroids
+    ctx.strokeStyle = '#bdbdbd';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    for (let a of asteroids) {
+      ctx.save();
+      ctx.translate(a.x, a.y);
+      ctx.rotate(a.angle);
+      ctx.beginPath();
+      const verts = a.verts;
+      for (let i=0;i<verts;i++) {
+        const ang = i/verts * TWO_PI;
+        const r = a.radius * (a.offset[i % a.offset.length]);
+        const x = Math.cos(ang) * r;
+        const y = Math.sin(ang) * r;
+        if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // bullets
+    ctx.fillStyle = '#ffd';
+    for (let b of bullets) {
+      ctx.beginPath(); ctx.arc(b.x, b.y, 2.5, 0, TWO_PI); ctx.fill();
+    }
+
+    // ship
+    if (!ship.dead) {
+      ctx.save();
+      ctx.translate(ship.x, ship.y);
+      ctx.rotate(ship.angle);
+      // blinking while invulnerable
+      if (ship.invulnerable > 0) {
+        const on = Math.floor(performance.now() / 120) % 2 === 0;
+        if (!on) { ctx.restore(); return; }
+      }
+      // ship body
+      ctx.beginPath();
+      ctx.moveTo(ship.radius, 0);
+      ctx.lineTo(-ship.radius*0.6, ship.radius*0.7);
+      ctx.lineTo(-ship.radius*0.4, 0);
+      ctx.lineTo(-ship.radius*0.6, -ship.radius*0.7);
+      ctx.closePath();
+      ctx.strokeStyle = '#dff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // thrust flame
+      if (keys.thrust) {
+        ctx.beginPath();
+        const t = Math.random()*8 + ship.radius;
+        ctx.moveTo(-ship.radius*0.6, 0);
+        ctx.lineTo(-t, -6);
+        ctx.lineTo(-t, 6);
+        ctx.closePath();
+        ctx.fillStyle = 'orange';
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // if paused overlay
+    if (paused) {
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = '#fff';
+      ctx.font = '32px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('PAUSED', W/2, H/2);
+    }
+  }
+
+  // Main loop
+  function loop(t) {
+    if (paused) return;
+    if (!lastTime) lastTime = t;
+    const dt = Math.min(0.05, (t - lastTime) / 1000);
+    lastTime = t;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // Start screen and controls wiring
+  const startScreen = document.getElementById('startScreen');
+  document.getElementById('startBtn').addEventListener('click', () => {
+    // resume audio context on user gesture
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    startScreen.style.display = 'none';
+    resetGame();
+    lastTime = performance.now();
+    loop(lastTime);
+  });
+
+  // Tilt (device orientation) support - optional
+  const tiltBtn = document.getElementById('tiltBtn');
+  let tiltEnabled = false;
+  function handleOrientation(e) {
+    // gamma: left-right tilt [-90,90], beta: front-back
+    const g = e.gamma || 0;
+    // map gamma to steering (left/right)
+    if (Math.abs(g) > 5) {
+      keys.left = g < -6;
+      keys.right = g > 6;
+      // smoother: set angle directly? we use boolean steering for simplicity
+    } else {
+      keys.left = false; keys.right = false;
+    }
+  }
+  tiltBtn.addEventListener('click', async () => {
+    if (tiltEnabled) {
+      window.removeEventListener('deviceorientation', handleOrientation);
+      tiltEnabled = false;
+      tiltBtn.textContent = 'ENABLE TILT';
+    } else {
+      // Some browsers (iOS) require permission
+      if (typeof DeviceOrientationEvent !== 'undefined' &&
+          typeof DeviceOrientationEvent.requestPermission === 'function') {
+        try {
+          const res = await DeviceOrientationEvent.requestPermission();
+          if (res !== 'granted') {
+            alert('Tilt permission denied.');
+            return;
+          }
+        } catch (err) {
+          alert('Tilt permission error: ' + err);
+          return;
+        }
+      }
+      window.addEventListener('deviceorientation', handleOrientation);
+      tiltEnabled = true;
+      tiltBtn.textContent = 'TILT ON';
+    }
+  });
+
+  // Prevent page from scrolling when touching game controls
+  document.body.addEventListener('touchmove', function(e) {
+    if (e.target.closest('.btn') || e.target === canvas) e.preventDefault();
+  }, {passive:false});
+
+  // Provide a resume if the user navigates away and comes back
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) paused = true;
+  });
+
+  // Start with start screen visible - provide a quick demo ship animation underneath
+  // (Game will start when user presses START.)
+  // Show simple tap hint on canvas
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#fff';
+  ctx.font = '20px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Press START to play', W/2, H/2);
+
+  // Simple touch anywhere to start also (optional)
+  canvas.addEventListener('touchstart', (e) => {
+    // do not start if touch on control buttons (they have own handlers)
+    if (startScreen.style.display !== 'none') {
+      // do nothing; rely on START button for audio permissions
+    }
+  });
+
+  // Save-highscore in localStorage (optional)
+  function saveHighscore() {
+    try {
+      const hs = Math.max(parseInt(localStorage.getItem('asteroids_hs')||'0'), score);
+      localStorage.setItem('asteroids_hs', Math.floor(hs));
+    } catch(e) {}
+  }
+  // on page unload, save score
+  window.addEventListener('beforeunload', saveHighscore);
+
+  // Expose simple restart if user finishes
+  function showStartScreen(autoRestart=false) {
+    startScreen.style.display = 'flex';
+    if (autoRestart) {
+      const msg = document.createElement('div');
+      msg.style.marginTop = '8px';
+      msg.style.color = '#ffd';
+      msg.textContent = 'Game Over — tap START to play again';
+      // replace or append
+      if (!startScreen.querySelector('.gameover')) {
+        msg.classList.add('gameover');
+        startScreen.appendChild(msg);
+      }
+    }
+    paused = true;
+    document.getElementById('btn-pause').textContent = '❚❚';
+  }
+
+  // touch to fire (alternate) - double tap detection on canvas to fire
+  let lastTap = 0;
+  canvas.addEventListener('touchend', (e) => {
+    const t = Date.now();
+    if (t - lastTap < 300) {
+      // double tap -> fire
+      shoot();
+    }
+    lastTap = t;
+  });
+
+  // expose global for debug in developer console (optional)
+  window._asteroids = {
+    resetGame, spawnAsteroids, getState: () => ({ score, lives, asteroids: asteroids.length })
+  };
+
+})();
+</script>
+</body>
+</html>
